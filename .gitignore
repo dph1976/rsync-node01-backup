@@ -1,0 +1,6 @@
+# Không bao giờ commit khóa/bí mật
+*.log
+*.key
+id_*
+.env
+*.pem
