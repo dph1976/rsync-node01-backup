@@ -15,22 +15,43 @@ LOG=/data/logs/vps/replicate_profiles.log
 if [ -t 1 ]; then exec > >(tee -a "$LOG") 2>&1; else exec >>"$LOG" 2>&1; fi
 echo "== $(date -Is) start ${ONLY:+(chỉ thử: $ONLY)}"
 
+# Report every invocation, including early exits, without requiring a remote shell.
+STARTED=$(date -Is)
+RESULT=ERROR
+report_result() {
+  local rc=$? report
+  trap - EXIT
+  report=$(mktemp "/tmp/sync-result-$(date +%Y%m%dT%H%M%S)-XXXXXX.log") || {
+    echo "FAIL create sync result file"; exit "$rc";
+  }
+  printf '%s started=%s mode=%s result=%s rc=%s ok=%s skip=%s fail=%s envfail=%s\n' \
+    "$(date -Is)" "$STARTED" "${ONLY:-full}" "$RESULT" "$rc" \
+    "${nok:--}" "${nskip:--}" "${nfail:--}" "${envfail:--}" > "$report"
+  if ! rsync -t --timeout=30 -e "$SSH" "$report" "$DEST:state/$(basename "$report")"; then
+    echo "FAIL push sync result (record remains in local log)"
+    cat "$report"
+  fi
+  rm -f -- "$report"
+  exit "$rc"
+}
+trap report_result EXIT
+
 exec 9>/var/lock/replicate_profiles.lock
-flock -n 9 || { echo "đang có lần chạy khác"; exit 0; }
+flock -n 9 || { RESULT=SKIP_LOCKED; echo "đang có lần chạy khác"; exit 0; }
 
 if [ -z "$ONLY" ] && [ "$(cat "$OKFILE" 2>/dev/null)" = "$DAY" ]; then
-  echo "hôm nay đã xong"; exit 0
+  RESULT=SKIP_ALREADY_DONE; echo "hôm nay đã xong"; exit 0
 fi
 
 if pgrep -f 'Worker_for_SmartOne.py|Worker_Controller.py|run_controller.sh|run_oot_summary.sh|backup_vps_volumes.sh|Controler_for_SSI.py|Worker_for_SSI.py|Get_token_for_SSI_accounts.py' >/dev/null; then
-  echo "còn tiến trình BOT3CC đang chạy -> thử lại sau"; exit 2
+  RESULT=SKIP_BUSY; echo "còn tiến trình BOT3CC đang chạy -> thử lại sau"; exit 2
 fi
 
-timeout 8 bash -c '</dev/tcp/100.90.40.40/22' || { echo "node-backup không tới được (cổng 22)"; exit 3; }
+timeout 8 bash -c '</dev/tcp/100.90.40.40/22' || { RESULT=UNREACHABLE; echo "node-backup không tới được (cổng 22)"; exit 3; }
 
 names=$(docker ps --format '{{.Names}}' | grep '^VPS\.' | sort)
 if [ -n "$ONLY" ]; then names=$(printf '%s\n' "$names" | grep -Fx "$ONLY"); fi
-[ -n "$names" ] || { echo "không có container VPS.* phù hợp"; exit 4; }
+[ -n "$names" ] || { RESULT=NO_CONTAINERS; echo "không có container VPS.* phù hợp"; exit 4; }
 
 export RES=$(mktemp /tmp/replicate_res.XXXXXX)
 
@@ -65,7 +86,8 @@ echo "profiles: OK=$nok SKIP=$nskip FAIL=$nfail"
 
 if [ -n "$ONLY" ]; then
   echo "== $(date -Is) end (chế độ thử, không sync env/state)"
-  [ "$nfail" -eq 0 ] && [ "$nskip" -eq 0 ]; exit $?
+  if [ "$nfail" -eq 0 ] && [ "$nskip" -eq 0 ]; then RESULT=TEST_OK; exit 0; fi
+  RESULT=TEST_INCOMPLETE; exit 1
 fi
 
 envfail=0
@@ -81,18 +103,27 @@ runuser -u node-admin -- git -C /home/node-admin/VPS-Automation describe --tags 
 runuser -u node-admin -- git -C /home/node-admin/VPS-Automation status --short           > "$S/vps-status.txt" 2>&1
 runuser -u node-admin -- git -C /home/node-admin/ssi-runtime describe --tags --always    > "$S/ssi-describe.txt" 2>&1
 crontab -u node-admin -l > "$S/crontab.txt" 2>&1
+if ! crontab -u root -l > "$S/crontab.root.txt" 2>&1; then
+  echo "FAIL read root crontab"; envfail=$((envfail+1))
+fi
 /home/node-admin/venv-automation/bin/python -m pip freeze > "$S/pip-freeze.txt" 2>&1
 docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' > "$S/docker-ps.txt" 2>&1
 docker image ls --digests > "$S/docker-images.txt" 2>&1
 
 push /home/node-admin/VPS-Automation/ env/VPS-Automation/ --exclude='logs/' --exclude='__pycache__/'
 push /home/node-admin/ssi-runtime/    env/ssi-runtime/    --exclude='logs/' --exclude='__pycache__/'
-push /home/node-admin/.secrets/bot3cc/ env/secrets-bot3cc/
-push "$S/" state/
+# Secrets are host-specific and must never be mirrored from node01.
+# Preserve receiver-side result records during the state mirror (--delete).
+push "$S/" state/ --exclude='/sync-result-*.log'
 
 if [ "$nfail" -eq 0 ] && [ "$nskip" -eq 0 ] && [ "$envfail" -eq 0 ]; then
   date -Is > /tmp/_LAST_OK
-  if rsync -t -e "$SSH" /tmp/_LAST_OK "$DEST:_LAST_OK"; then date +%F > "$OKFILE"; echo "ĐÃ XONG hôm nay"; fi
+  if rsync -t -e "$SSH" /tmp/_LAST_OK "$DEST:_LAST_OK"; then
+    date +%F > "$OKFILE"; echo "ĐÃ XONG hôm nay"
+  else
+    echo "FAIL push _LAST_OK"; envfail=$((envfail+1))
+  fi
 fi
 echo "== $(date -Is) end ok=$nok skip=$nskip fail=$nfail envfail=$envfail"
-[ "$nfail" -eq 0 ] && [ "$nskip" -eq 0 ] && [ "$envfail" -eq 0 ]
+if [ "$nfail" -eq 0 ] && [ "$nskip" -eq 0 ] && [ "$envfail" -eq 0 ]; then RESULT=OK; exit 0; fi
+RESULT=INCOMPLETE; exit 1

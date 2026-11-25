@@ -1,5 +1,6 @@
 # Crontab của ROOT trên node01 (sudo crontab -e). Chỉ cài sau khi đã chạy tay thành công.
-# 16:00 hằng ngày, thử lại 16:40 và 17:20; script tự bỏ qua nếu hôm nay đã xong hoặc còn worker/Chrome đang chạy.
+# 16:00 hằng ngày, thử lại 16:20; script tự bỏ qua nếu hôm nay đã xong hoặc còn worker/Chrome đang chạy.
 0 16 * * *  /usr/local/sbin/replicate_profiles.sh
-40 16 * * * /usr/local/sbin/replicate_profiles.sh
-20 17 * * * /usr/local/sbin/replicate_profiles.sh
+20 16 * * * /usr/local/sbin/replicate_profiles.sh
+
+# Chỉ thêm hai dòng sync; giữ nguyên các dòng poweroff hiện có (16:30 và 23:00).
